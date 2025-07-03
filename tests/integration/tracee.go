@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -94,8 +95,9 @@ func startTracee(ctx context.Context, t *testing.T, cfg config.Config, output *c
 
 	cfg.Capture = capture
 
-	cfg.PerfBufferSize = 1024
-	cfg.BlobPerfBufferSize = 1024
+	defaultBufferPages := (4096 * 1024) / os.Getpagesize() // 4 MB of contiguous pages
+	cfg.PerfBufferSize = defaultBufferPages
+	cfg.BlobPerfBufferSize = defaultBufferPages
 	cfg.PipelineChannelSize = 10000
 
 	// No process tree in the integration tests
@@ -217,7 +219,7 @@ func waitForTraceeOutputEvents(t *testing.T, waitFor time.Duration, actual *even
 	timeoutTicker := time.NewTicker(timeout)
 	defer timeoutTicker.Stop()
 
-	t.Logf("  . waiting for at least %d event(s) for %s", expectedEvts, timeout.String())
+	t.Logf("  . waiting for at least %d event(s), up to %s", expectedEvts, timeout.String())
 	defer t.Logf("  . done waiting for %d event(s)", expectedEvts)
 
 	for {

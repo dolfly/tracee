@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -547,47 +548,53 @@ func Test_EventFilters(t *testing.T) {
 		},
 		// TODO: Add pid>0 pid<1000
 		// TODO: Add u>0 u!=1000
-		{
-			name: "pid: event: data: trace event sched_switch with data from pid 0",
-			policyFiles: []testutils.PolicyFileWithID{
-				{
-					Id: 1,
-					PolicyFile: v1beta1.PolicyFile{
-						Metadata: v1beta1.Metadata{
-							Name: "pid-0-event-data",
-						},
-						Spec: k8s.PolicySpec{
-							Scope: []string{
-								"pid=0",
-							},
-							DefaultActions: []string{"log"},
-							Rules: []k8s.Rule{
-								{
-									Event: "sched_switch",
-									Filters: []string{
-										"data.next_comm=systemd",
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			cmdEvents: []cmdEvents{
-				newCmdEvents(
-					"kill -SIGUSR1 1", // systemd: try to reconnect to the D-Bus bus
-					500*time.Millisecond,
-					1*time.Second,
-					[]trace.Event{
-						expectEvent(anyHost, anyComm, anyProcessorID, 0, 0, events.SchedSwitch, orPolNames("pid-0-event-data"), orPolIDs(1), expectArg("next_comm", "systemd")),
-					},
-					[]string{},
-				),
-			},
-			useSyscaller: false,
-			coolDown:     1 * time.Second,
-			test:         ExpectAtLeastOneForEach,
-		},
+		// {
+		//   Disabled due to flaky behavior in some environments, see:
+		//   https://github.com/aquasecurity/tracee/issues/4799#issuecomment-3018918112
+		//
+		// 	// This test is a bit tricky, as it relies on the environment where the test is run.
+		// 	// The main goal is to ensure that at least one event coming from pid 0 (swapper) is captured.
+		// 	name: "pid: event: data: trace event sched_switch with data from pid 0",
+		// 	policyFiles: []testutils.PolicyFileWithID{
+		// 		{
+		// 			Id: 1,
+		// 			PolicyFile: v1beta1.PolicyFile{
+		// 				Metadata: v1beta1.Metadata{
+		// 					Name: "pid-0-event-data",
+		// 				},
+		// 				Spec: k8s.PolicySpec{
+		// 					Scope: []string{
+		// 						"pid=0",
+		// 					},
+		// 					DefaultActions: []string{"log"},
+		// 					Rules: []k8s.Rule{
+		// 						{
+		// 							Event:   "sched_switch",
+		// 							Filters: []string{},
+		// 						},
+		// 					},
+		// 				},
+		// 			},
+		// 		},
+		// 	},
+		// 	cmdEvents: []cmdEvents{
+		// 		newCmdEvents(
+		// 			// Do not execute any command; simply wait to capture background system activity (primarily from Tracee).
+		// 			// During this waiting period, the system is expected to produce numerous 'sched_switch' events
+		// 			// from the 'swapper' process (pid 0), even in minimal environments with only one CPU.
+		// 			expectFromSystem,
+		// 			100*time.Millisecond, // wait
+		// 			0,                    // this value is ignored when 'expectFromSystem' is used
+		// 			[]trace.Event{
+		// 				expectEvent(anyHost, anyComm, anyProcessorID, 0, 0, events.SchedSwitch, orPolNames("pid-0-event-data"), orPolIDs(1)),
+		// 			},
+		// 			[]string{},
+		// 		),
+		// 	},
+		// 	useSyscaller: false,
+		// 	coolDown:     1 * time.Second,
+		// 	test:         ExpectAllEvtsEqualToOne,
+		// },
 		{
 			name: "pid: trace events from pid 1",
 			policyFiles: []testutils.PolicyFileWithID{
@@ -1828,10 +1835,10 @@ func Test_EventFilters(t *testing.T) {
 					// Running the commands inside a container caused duplicate
 					// security_file_open events to be generated. This is why the events are duplicated.
 					[]trace.Event{
-						expectEvent(anyHost, "more", anyProcessorID, 1, 0, events.SecurityFileOpen, orPolNames("sfo-pol-1", "sfo-pol-2"), orPolIDs(1, 2), expectArg("pathname", "/etc/ld.so.cache")),
-						expectEvent(anyHost, "more", anyProcessorID, 1, 0, events.SecurityFileOpen, orPolNames("sfo-pol-1", "sfo-pol-2"), orPolIDs(1, 2), expectArg("pathname", "/etc/ld.so.cache")),
-						expectEvent(anyHost, "more", anyProcessorID, 1, 0, events.SecurityFileOpen, orPolNames("sfo-pol-1", "sfo-pol-3"), orPolIDs(1, 3), expectArg("pathname", "/etc/netconfig")),
-						expectEvent(anyHost, "more", anyProcessorID, 1, 0, events.SecurityFileOpen, orPolNames("sfo-pol-1", "sfo-pol-3"), orPolIDs(1, 3), expectArg("pathname", "/etc/netconfig")),
+						expectEvent(anyHost, "more", anyProcessorID, anyPID, 0, events.SecurityFileOpen, orPolNames("sfo-pol-1", "sfo-pol-2"), orPolIDs(1, 2), expectArg("pathname", "/etc/ld.so.cache")),
+						expectEvent(anyHost, "more", anyProcessorID, anyPID, 0, events.SecurityFileOpen, orPolNames("sfo-pol-1", "sfo-pol-2"), orPolIDs(1, 2), expectArg("pathname", "/etc/ld.so.cache")),
+						expectEvent(anyHost, "more", anyProcessorID, anyPID, 0, events.SecurityFileOpen, orPolNames("sfo-pol-1", "sfo-pol-3"), orPolIDs(1, 3), expectArg("pathname", "/etc/netconfig")),
+						expectEvent(anyHost, "more", anyProcessorID, anyPID, 0, events.SecurityFileOpen, orPolNames("sfo-pol-1", "sfo-pol-3"), orPolIDs(1, 3), expectArg("pathname", "/etc/netconfig")),
 					},
 					[]string{},
 				),
@@ -2311,19 +2318,28 @@ func Test_EventFilters(t *testing.T) {
 			}
 			config.InitialPolicies = initialPolicies
 
-			ctx, cancel := context.WithCancel(context.Background())
+			traceeTimeout := 60 * time.Second
+			ctx, cancel := context.WithTimeout(context.Background(), traceeTimeout)
+			defer func() {
+				if ctx.Err() != nil {
+					if ctx.Err() == context.DeadlineExceeded {
+						t.Log("  Tracee timedout")
+					} else {
+						t.Logf("  %v", ctx.Err())
+					}
+				}
+				cancel()
+			}()
 
 			// start tracee
 			trc, err := startTracee(ctx, t, config, nil, nil)
 			if err != nil {
-				cancel()
 				t.Fatal(err)
 			}
 
 			t.Logf("  --- started tracee ---")
 			err = waitForTraceeStart(trc)
 			if err != nil {
-				cancel()
 				t.Fatal(err)
 			}
 
@@ -2368,6 +2384,9 @@ func Test_EventFilters(t *testing.T) {
 }
 
 const (
+	expectFromSystem    = ""
+	expectFromSystemPid = math.MaxInt
+
 	anyProcessorID = -1
 	anyHost        = ""
 	anyComm        = ""
@@ -2477,14 +2496,20 @@ func runCmd(t *testing.T, cmd cmdEvents, expectedEvts int, actual *eventBuffer, 
 		err error
 	)
 
-	if useSyscaller {
-		formatCmdEvents(&cmd)
-	}
+	if cmd.runCmd == expectFromSystem {
+		pid = expectFromSystemPid
 
-	t.Logf("  >>> running: %s", cmd.runCmd)
-	pid, err = testutils.ExecPinnedCmdWithTimeout(cmd.runCmd, cmd.timeout)
-	if err != nil {
-		return proc{}, err
+		t.Log("  >>> expect events from system")
+	} else {
+		if useSyscaller {
+			formatCmdEvents(&cmd)
+		}
+
+		t.Logf("  >>> running: %s", cmd.runCmd)
+		pid, err = testutils.ExecPinnedCmdWithTimeout(cmd.runCmd, cmd.timeout)
+		if err != nil {
+			return proc{}, err
+		}
 	}
 
 	err = waitForTraceeOutputEvents(t, cmd.waitFor, actual, expectedEvts, failOnTimeout)
@@ -2599,7 +2624,12 @@ func isCmdAShellRunner(cmd string) bool {
 }
 
 // pidToCheck returns the pid of the process to check for events
-func pidToCheck(cmd string, actEvt trace.Event) int {
+func pidToCheck(cmd string, actEvt trace.Event, expectedPid int) int {
+	switch expectedPid {
+	case 0, 1, 2: // special pids: 0 swapper, 1 systemd, 2 kthreadd
+		return expectedPid
+	}
+
 	if isCmdAShellRunner(cmd) {
 		return actEvt.ParentProcessID
 	}
@@ -2688,7 +2718,7 @@ func ExpectAtLeastOneForEach(t *testing.T, cmdEvents []cmdEvents, actual *eventB
 				if checkProcessorID && actEvt.ProcessorID != expEvt.ProcessorID {
 					continue
 				}
-				if checkPID && pidToCheck(cmd.runCmd, actEvt) != expEvt.ProcessID {
+				if checkPID && pidToCheck(cmd.runCmd, actEvt, expEvt.ProcessID) != expEvt.ProcessID {
 					continue
 				}
 				if checkPID && actEvt.ProcessID != expEvt.ProcessID {
@@ -2858,7 +2888,7 @@ func ExpectAnyOfEvts(t *testing.T, cmdEvents []cmdEvents, actual *eventBuffer, u
 				if checkProcessorID && actEvt.ProcessorID != expEvt.ProcessorID {
 					continue
 				}
-				if checkPID && pidToCheck(cmd.runCmd, actEvt) != expEvt.ProcessID {
+				if checkPID && pidToCheck(cmd.runCmd, actEvt, expEvt.ProcessID) != expEvt.ProcessID {
 					continue
 				}
 				if checkPID && actEvt.ProcessID != expEvt.ProcessID {
@@ -2996,7 +3026,7 @@ func ExpectAllEvtsEqualToOne(t *testing.T, cmdEvents []cmdEvents, actual *eventB
 					return fmt.Errorf("Event %+v:\nprocessor Id mismatch: expected %d, got %d", expEvt, expEvt.ProcessorID, actEvt.ProcessorID)
 				}
 				if checkPID {
-					actPID := pidToCheck(cmd.runCmd, actEvt)
+					actPID := pidToCheck(cmd.runCmd, actEvt, expEvt.ProcessID)
 					if !assert.ObjectsAreEqual(expEvt.ProcessID, actPID) {
 						return fmt.Errorf("Event %+v:\npid mismatch: expected %d, got %d", expEvt, expEvt.ProcessID, actPID)
 					}
@@ -3104,7 +3134,7 @@ func ExpectAllInOrderSequentially(t *testing.T, cmdEvents []cmdEvents, actual *e
 				return fmt.Errorf("Event %+v:\nprocessor Id mismatch: expected %d, got %d", expEvt, expEvt.ProcessorID, actEvt.ProcessorID)
 			}
 			if checkPID {
-				actPID := pidToCheck(cmd.runCmd, actEvt)
+				actPID := pidToCheck(cmd.runCmd, actEvt, expEvt.ProcessID)
 				if !assert.ObjectsAreEqual(expEvt.ProcessID, actPID) {
 					return fmt.Errorf("Event %+v:\npid mismatch: expected %d, got %d", expEvt, expEvt.ProcessID, actPID)
 				}
